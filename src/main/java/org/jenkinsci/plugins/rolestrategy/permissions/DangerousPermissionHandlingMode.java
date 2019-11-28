@@ -36,7 +36,7 @@ import org.kohsuke.accmod.restrictions.NoExternalUse;
  * @since TODO
  */
 public enum DangerousPermissionHandlingMode {
-    
+
     /**
      * Dangerous permissions are explicitly disabled.
      * They will be hidden from UI, and the settings will be ignored.
@@ -53,17 +53,16 @@ public enum DangerousPermissionHandlingMode {
     /**
      * The behavior is up to the global settings and the migration logic.
      * By default the permissions will be blocked, but there will be an administrative warning if any permission is set.
-     * 
+     *
      */
     UNDEFINED;
-    
+
     @Restricted(NoExternalUse.class)
     public static final String PROPERTY_NAME = DangerousPermissionHandlingMode.class.getName() + ".enableDangerousPermissions";
-    
+
     @Nonnull
-    @Restricted(NoExternalUse.class)
     @SuppressFBWarnings(value = "MS_SHOULD_BE_REFACTORED_TO_BE_FINAL", justification = "Groovy script console access")
-    public static /* allow script access */ DangerousPermissionHandlingMode CURRENT;
+    private static DangerousPermissionHandlingMode CURRENT;
 
     static {
         String str = System.getProperty(PROPERTY_NAME);
@@ -81,5 +80,16 @@ public enum DangerousPermissionHandlingMode {
     @Nonnull
     public static DangerousPermissionHandlingMode getCurrent() {
         return CURRENT;
+    }
+
+    /**
+     * Set the {@link DangerousPermissionHandlingMode}
+     *
+     * @param mode the {@code DangerousPermissionHandlingMode} to be set
+     */
+    @Restricted(NoExternalUse.class)
+    public static void setCURRENT(@Nonnull DangerousPermissionHandlingMode mode) {
+        CURRENT = mode;
+        RoleMap.invalidateDangerousPermissions();
     }
 }

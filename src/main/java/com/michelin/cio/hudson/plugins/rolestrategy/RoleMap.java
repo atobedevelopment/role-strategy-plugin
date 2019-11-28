@@ -30,20 +30,22 @@ import com.synopsys.arc.jenkins.plugins.rolestrategy.Macro;
 import com.synopsys.arc.jenkins.plugins.rolestrategy.RoleMacroExtension;
 import com.synopsys.arc.jenkins.plugins.rolestrategy.RoleType;
 import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
+import hudson.model.Item;
 import hudson.model.Items;
 import hudson.model.User;
 import hudson.security.AccessControlled;
 import hudson.security.Permission;
 import hudson.security.SidACL;
-import hudson.model.Job;
 import jenkins.model.Jenkins;
-
 import org.acegisecurity.BadCredentialsException;
 import org.acegisecurity.GrantedAuthority;
 import org.acegisecurity.acls.sid.Sid;
 import org.acegisecurity.userdetails.UserDetails;
 import org.jenkinsci.plugins.rolestrategy.Settings;
+import org.jenkinsci.plugins.rolestrategy.permissions.DangerousPermissionHandlingMode;
 import org.jenkinsci.plugins.rolestrategy.permissions.PermissionHelper;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.springframework.dao.DataAccessException;
 
@@ -60,6 +62,8 @@ import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
@@ -79,13 +83,29 @@ public class RoleMap {
   private final SortedMap <Role,Set<String>> grantedRoles;
 
   private static final Logger LOGGER = Logger.getLogger(RoleMap.class.getName());
-  
+
+  private static final ConcurrentMap<Permission, Set<Permission>> implyingPermissionCache = new ConcurrentHashMap<>();
+
+  static {
+    Permission.getAll().forEach(RoleMap::cacheImplyingPermissions);
+  }
+
   private final Cache<String, UserDetails> cache = CacheBuilder.newBuilder()
           .softValues()
           .maximumSize(Settings.USER_DETAILS_CACHE_MAX_SIZE)
           .expireAfterWrite(Settings.USER_DETAILS_CACHE_EXPIRATION_TIME_SEC, TimeUnit.SECONDS)
           .build();
 
+  /**
+   * {@link RoleMap}s are created again and again using {@link RoleMap#newMatchingRoleMap(String)}
+   * for different permissions for the same {@code itemNamePrefix}, so cache them and avoid wasting time
+   * matching regular expressions.
+   */
+  private final Cache<String, RoleMap> matchingRoleMapCache = CacheBuilder.newBuilder()
+          .softValues()
+          .maximumSize(2048)
+          .expireAfterWrite(1, TimeUnit.HOURS)
+          .build();
 
   RoleMap() {
     this.grantedRoles = new ConcurrentSkipListMap<Role, Set<String>>();
@@ -101,21 +121,21 @@ public class RoleMap {
     }
 
   /**
+   * Invalidate the dangerous permissions from the cache when the {@link DangerousPermissionHandlingMode} changes.
+   */
+  @Restricted(NoExternalUse.class)
+  public static void invalidateDangerousPermissions() {
+    PermissionHelper.DANGEROUS_PERMISSIONS.forEach(implyingPermissionCache::remove);
+  }
+
+  /**
    * Check if the given sid has the provided {@link Permission}.
    * @return True if the sid's granted permission
    */
-  private boolean hasPermission(String sid, Permission p, RoleType roleType, AccessControlled controlledItem) {
-    if (PermissionHelper.isDangerous(p)) {
-      /* if this is a dangerous permission, fall back to Administer unless we're in compat mode */
-      p = Jenkins.ADMINISTER;
-    }
-    final Set<Permission> permissions = new HashSet<>();
-    final Permission per = p;
-    final boolean[] temp = {false};
-    // Get the implying permissions
-    for (; p!=null; p=p.impliedBy) {
-      permissions.add(p);
-    }
+  private boolean hasPermission(String sid, Permission permission, RoleType roleType, AccessControlled controlledItem) {
+    final Set<Permission> permissions = getImplyingPermissions(permission);
+    final boolean[] hasPermission = { false };
+
     // Walk through the roles, and only add the roles having the given permission,
     // or a permission implying the given permission
     new RoleWalker() {
@@ -127,29 +147,27 @@ public class RoleMap {
               Macro macro = RoleMacroExtension.getMacro(current.getName());
               if (macro != null) {
                 RoleMacroExtension macroExtension = RoleMacroExtension.getMacroExtension(macro.getName());
-                if (macroExtension.IsApplicable(roleType) && macroExtension.hasPermission(sid, per, roleType, controlledItem, macro)) {
-                  temp[0] =true;
+                if (macroExtension.IsApplicable(roleType) && macroExtension.hasPermission(sid, permission, roleType, controlledItem, macro)) {
+                  hasPermission[0] = true;
                   abort();
-                  return ;
                 }
               }
             } else {
-              temp[0] =true;
+              hasPermission[0] = true;
               abort();
-              return ;
             }
           } else if (Settings.TREAT_USER_AUTHORITIES_AS_ROLES) {
             try {
               UserDetails userDetails = cache.getIfPresent(sid);
               if (userDetails == null) {
-                userDetails = Jenkins.getActiveInstance().getSecurityRealm().loadUserByUsername(sid);
+                userDetails = Jenkins.getInstance().getSecurityRealm().loadUserByUsername(sid);
                 cache.put(sid, userDetails);
               }
               for (GrantedAuthority grantedAuthority : userDetails.getAuthorities()) {
                 if (grantedAuthority.getAuthority().equals(current.getName())) {
-                  temp[0] =true;
+                  hasPermission[0] = true;
                   abort();
-                  return ;
+                  return;
                 }
               }
             } catch (BadCredentialsException e) {
@@ -165,12 +183,51 @@ public class RoleMap {
         }
       }
     };
-    return temp[0];
+    return hasPermission[0];
+  }
+
+  /**
+   * Get the set of permissions which imply the permission {@code p}
+   *
+   * @param p find permissions that imply this permission
+   * @return set of permissions which imply {@code p}
+   */
+  private static Set<Permission> getImplyingPermissions(Permission p) {
+    Set<Permission> implyingPermissions = implyingPermissionCache.get(p);
+    if (implyingPermissions != null) {
+      return implyingPermissions;
+    } else {
+      return cacheImplyingPermissions(p);
+    }
+  }
+
+  /**
+   * Finds the implying permissions and caches them for future use.
+   *
+   * @param permission the permission for which to cache implying permissions
+   * @return a set of permissions that imply this permission (including itself)
+   */
+  private static Set<Permission> cacheImplyingPermissions(Permission permission) {
+    Set<Permission> implyingPermissions;
+    if (PermissionHelper.isDangerous(permission)) {
+      /* if this is a dangerous permission, fall back to Administer unless we're in compat mode */
+      implyingPermissions = getImplyingPermissions(Jenkins.ADMINISTER);
+    } else {
+      implyingPermissions = new HashSet<>();
+
+      // Get the implying permissions
+      for (Permission p = permission; p != null; p = p.impliedBy) {
+        implyingPermissions.add(p);
+      }
+    }
+
+    implyingPermissionCache.put(permission, implyingPermissions);
+    return implyingPermissions;
   }
 
   /**
    * Check if the {@link RoleMap} contains the given {@link Role}.
-   * 
+   *
    * @param role Role to be checked
    * @return {@code true} if the {@link RoleMap} contains the given role
    */
@@ -193,8 +250,8 @@ public class RoleMap {
   public void addRole(Role role) {
       if (this.getRole(role.getName()) == null) {
           this.grantedRoles.put(role, new CopyOnWriteArraySet<>());
+          matchingRoleMapCache.invalidateAll();
       }
-
   }
 
   /**
@@ -215,11 +272,10 @@ public class RoleMap {
    * @since 2.6.0
    */
   public void unAssignRole(Role role, String sid) {
-    if (this.hasRole(role)) {
-      if (this.grantedRoles.get(role).contains(sid)) {
-        this.grantedRoles.get(role).remove(sid);
+      Set<String> sids = grantedRoles.get(role);
+      if (sids != null) {
+        sids.remove(sid);
       }
-    }
   }
 
   /**
@@ -231,7 +287,7 @@ public class RoleMap {
       this.grantedRoles.get(role).clear();
     }
   }
-  
+
   /**
    * Clear all the roles associated to the given sid
    * @param sid The sid for thwich you want to clear the {@link Role}s
@@ -287,15 +343,16 @@ public class RoleMap {
     }
     return null;
   }
-  
+
   /**
    * Removes a {@link Role}
    * @param role The {@link Role} which shall be removed
    */
   public void removeRole(Role role){
       this.grantedRoles.remove(role);
+      matchingRoleMapCache.invalidateAll();
   }
-  
+
 
   /**
    * Get an unmodifiable sorted map containing {@link Role}s and their assigned sids.
@@ -354,50 +411,31 @@ public class RoleMap {
   }
 
   /**
-   * Create a sub-map of the current {@link RoleMap} containing only the
-   * {@link Role}s matching the given pattern.
-   * @param namePattern The pattern to match
-   * @return A {@link RoleMap} containing only {@link Role}s matching the given name
+   * Create a sub-map of this {@link RoleMap} containing {@link Role}s that are applicable
+   * on the given {@code itemNamePrefix}.
+   *
+   * @param itemNamePrefix the name of the {@link hudson.model.AbstractItem} or {@link hudson.model.Computer}
+   * @return A {@link RoleMap} containing roles that are applicable on the itemNamePrefix
    */
+  public RoleMap newMatchingRoleMap(String itemNamePrefix) {
+    RoleMap cachedRoleMap = matchingRoleMapCache.getIfPresent(itemNamePrefix);
+    if (cachedRoleMap != null) {
+      return cachedRoleMap;
+    }
 
-  public RoleMap newMatchingRoleMap(String namePattern) {
     SortedMap<Role, Set<String>> roleMap = new TreeMap<>();
     new RoleWalker() {
       public void perform(Role current) {
-        Matcher m = current.getPattern().matcher(namePattern);
+        Matcher m = current.getPattern().matcher(itemNamePrefix);
         if (m.matches()) {
           roleMap.put(current, grantedRoles.get(current));
         }
       }
     };
-    return new RoleMap(roleMap);
-  }
 
-  /**
-   * Get all the roles holding the given permission.
-   * @param permission The permission you want to check
-   * @return A Set of Roles holding the given permission
-   */
-  private Set<Role> getRolesHavingPermission(final Permission permission) {
-    final Set<Role> roles = new HashSet<>();
-    final Set<Permission> permissions = new HashSet<>();
-    Permission p = permission;
-
-    // Get the implying permissions
-    for (; p!=null; p=p.impliedBy) {
-      permissions.add(p);
-    }
-    // Walk through the roles, and only add the roles having the given permission,
-    // or a permission implying the given permission
-    new RoleWalker() {
-      public void perform(Role current) {
-        if (current.hasAnyPermission(permissions)) {
-          roles.add(current);
-        }
-      }
-    };
-
-    return roles;
+    RoleMap newMatchingRoleMap = new RoleMap(roleMap);
+    matchingRoleMapCache.put(itemNamePrefix, newMatchingRoleMap);
+    return newMatchingRoleMap;
   }
 
   /**
@@ -407,11 +445,11 @@ public class RoleMap {
    * @return List of matching job names
    */
   public static List<String> getMatchingJobNames(Pattern pattern, int maxJobs) {
-      Iterator<Job> jobs = Items.allItems(Jenkins.getInstance(), Job.class).iterator();
+      Iterator<Item> jobs = Items.allItems(Jenkins.getInstance(), Item.class).iterator();
       List<String> matchingJobNames = new ArrayList<>();
 
       while(jobs.hasNext() && matchingJobNames.size() < maxJobs) {
-          Job job = jobs.next();
+          Item job = jobs.next();
           String jobName = job.getFullName();
 
           Matcher m = pattern.matcher(jobName);
@@ -422,7 +460,7 @@ public class RoleMap {
 
       return matchingJobNames;
   }
-   
+
   /**
    * The Acl class that will delegate the permission check to the {@link RoleMap} object.
    */
@@ -435,7 +473,7 @@ public class RoleMap {
         this.item = item;
         this.roleType = roleType;
     }
-     
+
     /**
      * Checks if the sid has the given permission.
      * <p>Actually only delegate the check to the {@link RoleMap} instance.</p>
@@ -465,8 +503,8 @@ public class RoleMap {
     }
     /**
      * Aborts the iterations.
-     * The method can be used from RoleWalker callbacks to preemptively abort the execution loops on some conditions. 
-     * @since TODO 
+     * The method can be used from RoleWalker callbacks to preemptively abort the execution loops on some conditions.
+     * @since TODO
      */
     public void abort() {
       this.shouldAbort=true;
