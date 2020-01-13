@@ -117,7 +117,10 @@ public class RoleMap {
      */
     @DataBoundConstructor
     public RoleMap(@Nonnull SortedMap<Role,Set<String>> grantedRoles) {
-        this.grantedRoles = new ConcurrentSkipListMap<Role, Set<String>>(grantedRoles);
+        this();
+        for (Map.Entry<Role,Set<String>> entry : grantedRoles.entrySet()) {
+          this.grantedRoles.put(entry.getKey(), new HashSet<>(entry.getValue()));
+        }
     }
 
   /**
@@ -294,7 +297,6 @@ public class RoleMap {
    */
   public void deleteSids(String sid){
      for (Map.Entry<Role, Set<String>> entry: grantedRoles.entrySet()) {
-         Role role = entry.getKey();
          Set<String> sids = entry.getValue();
          if (sids.contains(sid)) {
              sids.remove(sid);

@@ -5,6 +5,7 @@
         <groupId>org.jenkins-ci.plugins</groupId>
         <artifactId>plugin</artifactId>
         <version>3.46</version>
+        <relativePath />
     </parent>
 
     <artifactId>role-strategy</artifactId>
@@ -39,7 +40,7 @@
     </developers>
 
     <properties>
-        <revision>2.16</revision>
+        <revision>2.17</revision>
         <changelist>-SNAPSHOT</changelist>
         <jenkins.version>2.60.3</jenkins.version>
         <java.level>8</java.level>
